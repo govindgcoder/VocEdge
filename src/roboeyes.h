@@ -16,8 +16,8 @@ constexpr int RIGHT_EYE_X = 80;   // right eye horizontal origin
 constexpr int EYE_Y       = 18;   // vertical origin for both eyes
 constexpr int EYE_W       = 25;   // default eye width
 constexpr int EYE_H       = 30;   // default eye height
-constexpr int FOCUS_W     = 28;   // widened eye width for focus mode
-constexpr int FOCUS_H     = 34;   // widened eye height for focus mode
+constexpr int FOCUS_W     = 30;   // widened eye width for focus mode
+constexpr int FOCUS_H     = 36;   // widened eye height for focus mode
 
 constexpr uint16_t FRAME_TIME       = 25;   // ~40fps cap
 constexpr uint32_t BLINK_INTERVAL   = 4000; // ms between blinks

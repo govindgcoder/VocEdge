@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VocEdge Dashboard</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #0f1115; color: #e6e6e6; }
+  header { padding: 12px 18px; border-bottom: 1px solid #1f242d; display: flex; justify-content: space-between; align-items: center; background: #13161c; }
+  header h1 { font-size: 16px; font-weight: 600; letter-spacing: 0.5px; }
+  header span { font-size: 12px; color: #8a8f98; }
+  .grid { display: grid; grid-template-columns: 240px 1fr 240px; gap: 12px; padding: 12px; height: calc(100vh - 49px); }
+  .col { background: #161a22; border: 1px solid #20262f; border-radius: 10px; padding: 12px; overflow: hidden; display: flex; flex-direction: column; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #8a8f98; margin-bottom: 10px; }
+  .node { padding: 8px; border-radius: 8px; background: #1b2029; border: 1px solid #242b36; margin-bottom: 8px; font-size: 13px; }
+  .node .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; }
+  .on { background: #34d399; box-shadow: 0 0 6px #34d399; }
+  .off { background: #64748b; }
+  .log { flex: 1; overflow-y: auto; font-size: 13px; }
+  .entry { padding: 8px 10px; border-bottom: 1px solid #1b2029; }
+  .entry .t { color: #6b7280; font-size: 11px; }
+  .entry .heard { color: #93c5fd; }
+  .entry .rply { color: #f0abfc; }
+  .home .card { padding: 10px; border-radius: 8px; background: #1b2029; border: 1px solid #242b36; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between; }
+  .badge { font-size: 18px; font-weight: 700; }
+  .badge.on { color: #34d399; }
+  .badge.off { color: #64748b; }
+  .name { color: #8a8f98; font-size: 12px; }
+  .last-wifi { font-size: 11px; color: #6b7280; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+function App() {
+  const [data, setData] = useState({ nodes: [], log: [], home: { lights: [] } });
+  const logRef = useRef(null);
+
+  useEffect(() => {
+    const tick = () =>
+      fetch('/api/status')
+        .then((r) => r.json())
+        .then(setData)
+        .catch(() => {});
+    tick();
+    const t = setInterval(tick, 2000);
+    return () => clearInterval(t);
+  }, []);
+
+  useEffect(() => {
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [data.log]);
+
+  const lights = data.home.lights || [];
+  const light = lights.length ? lights[0] : null;
+
+  return (
+    <div className="grid">
+      <section className="col">
+        <h2>Connected Nodes</h2>
+        {data.nodes.length === 0 && <div className="last-wifi">waiting for beacons...</div>}
+        {data.nodes.map((n) => (
+          <div className="node" key={n.ip}>
+            <span className={'dot ' + (n.connected ? 'on' : 'off')} />
+            {n.ip}
+            <div className="last-wifi">{n.lights_on ? 'light on' : 'light off'}</div>
+          </div>
+        ))}
+      </section>
+
+      <section className="col">
+        <h2>Current Stream</h2>
+        <div className="log" ref={logRef}>
+          {data.log.length === 0 && <div className="last-wifi">no activity yet...</div>}
+          {data.log.map((e, i) => (
+            <div className="entry" key={i}>
+              <span className="t">{e.t} {e.node} - </span>
+              <span className="heard">"{e.heard}"</span>
+              <div className="rply">{e.reply}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="col home">
+        <h2>Home Status</h2>
+        <div className="card">
+          <span className="name">Light 1</span>
+          <span className={'badge ' + (light ? 'on' : 'off')}>{light ? 'ON' : 'OFF'}</span>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

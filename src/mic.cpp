@@ -13,11 +13,11 @@ static bool voice_active = false;       // true while momentum > 0
 static bool heard_speech = false;       // set once the first spoken frame arrives
 
 #define VOICE_LEVEL_PADDING 300.0f // RMS above noise floor counts as speech
-#define MOMENTUM_CAP 20            // max bucket fill (frames of pause grace)
+#define MOMENTUM_CAP 18            // max bucket fill (frames of pause grace)
 #define MOMENTUM_UP 5              // fill per loud frame
 #define MOMENTUM_DOWN 1            // leak per quiet frame
 #define MAX_RECORD_MS 10000        // safety cap so a stuck mic can't hang forever
-#define RMS_EMA_ALPHA 0.30f        // lower = more damping of single-frame spikes
+#define RMS_EMA_ALPHA 0.25f        // lower = more damping of single-frame spikes
 
 void setup_mic() {
   i2s_config_t i2s_config = {

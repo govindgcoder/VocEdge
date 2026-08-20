@@ -21,8 +21,6 @@
 using std::max;
 using std::min;
 
-#include <vocedge_inferencing.h> // EI project
-
 // for message
 enum MsgType : uint8_t { MSG_AUDIO = 0x01, MSG_END = 0x02, MSG_TEXT = 0x03 };
 
@@ -30,6 +28,7 @@ constexpr int MAX_LINES = 64;      // max lines for wrapped text
 constexpr int CHARS_PER_LINE = 10; // max chars before wrapping
 
 constexpr uint16_t LOADING_SPEED = 300;      // dot animation speed
+constexpr uint32_t LOADING_TIMEOUT_MS = 45000; // give slow CPU inference time to reply
 constexpr uint16_t TEXT_SCROLL_SPEED = 1200; // ms between scroll steps
 constexpr uint32_t END_HOLD_DELAY = 2000;    // hold at end of text
 constexpr uint32_t CALIBRATE_INTERVAL_MS = 120000; // recalibrate ambient noise in idle
@@ -69,10 +68,10 @@ static size_t rxlen = 0;
 // Wake-word audio sliding window (matches the EI model: 1s @ 16kHz)
 #define EI_WINDOW_SIZE EI_CLASSIFIER_RAW_SAMPLE_COUNT
 static int16_t ei_buffer[EI_WINDOW_SIZE];      // last 1s of ambient audio
-static size_t ei_buffer_ptr = 0;               // samples since last inference
+static size_t ei_buffer_ptr = 0;               // samples since last inference2
 #define EI_INFER_EVERY_SAMPLES 4000            // ~250ms of new audio per inference
 #define WAKE_CLASS "wake"                      // label trained for the wake word
-#define WAKE_THRESHOLD 0.80f                   // min confidence to wake up
+#define WAKE_THRESHOLD 0.85f                   // min confidence to wake up
 
 static int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
   numpy::int16_to_float(&ei_buffer[offset], out_ptr, length);
@@ -314,15 +313,15 @@ void loop() {
             String value = doc["value"].as<String>();
 
             if (action == "lights") {
-              // Toggle instead of trusting the STT/LLM value — prevents an
-              // "already on/off" desync like "It's off." -> value "1"
-              lightsOn = !lightsOn;
-
-              // Built-in NeoPixel command for ESP32-S3 (Pin, R, G, B)
-              // If it's a standard LED instead, change this to digitalWrite(48, lightsOn);
-              neopixelWrite(48, lightsOn ? 255 : 0, lightsOn ? 255 : 0, lightsOn ? 255 : 0);
-
-              reply = lightsOn ? "Lights ON!" : "Lights OFF";
+              // Apply the requested state rather than blindly toggling, so both
+              // sides stay in sync (PC and ESP store the same lightsOn value).
+              bool want_on = value.equalsIgnoreCase("1") ||
+                             value.equalsIgnoreCase("on") || value.equalsIgnoreCase("true");
+              if (want_on != lightsOn) {
+                lightsOn = want_on; // toggle on the ESP side only if needed
+                neopixelWrite(48, lightsOn ? 255 : 0, lightsOn ? 255 : 0, lightsOn ? 255 : 0);
+              }
+              reply = want_on ? "Lights ON!" : "Lights OFF";
             } else {
               // Standard conversation reply
               reply = value;
@@ -397,7 +396,19 @@ void loop() {
     }
     break;
 
-  case RECORDING: {
+case RECORDING: {
+    // Keep the focused "listening" eyes on screen while we capture audio
+    // (focus() renders a fresh frame each call, so the screen stays alive).
+    focus();
+
+    // If the host dropped mid-sentence, don't record into the void - fail fast.
+    if (!client || !client.connected()) {
+      Serial.println("[!] Host disconnected during recording - aborting.");
+      reply = "No connection";
+      changeState(SHOW);
+      break;
+    }
+
     size_t bytes_read = record();
 
     static uint8_t fb[2048 + 8];
@@ -427,10 +438,25 @@ void loop() {
     break;
   }
   case SENDING:
-    changeState(LOADING_STATE); // immediately show loading
+    // No way to reach the PC? Say so instead of hanging on the dots forever.
+    if (!wifi_connected || !(client && client.connected())) {
+      Serial.println("[!] No WiFi/client - aborting to connection message.");
+      reply = "No connection";
+      changeState(SHOW);
+    } else {
+      changeState(LOADING_STATE); // immediately show loading
+    }
     break;
   case LOADING_STATE:
-    loading(); // animate dots
+    // Safety timeout: if the response never arrives (WiFi dropped mid-request,
+    // PC client died), leave the dots rather than hanging forever.
+    if (millis() - stateStartTime >= LOADING_TIMEOUT_MS) {
+      Serial.println("[!] Loading timed out - aborting.");
+      reply = "No response";
+      changeState(SHOW);
+    } else {
+      loading(); // animate dots
+    }
     break;
   case SHOW:
     if (show(reply))
@@ -438,9 +464,14 @@ void loop() {
     break;
   }
 
-  // WiFi status dot: 2x2 px with a 1px gutter from the top-left corner
+  // Status indicators (2x2 px each, 1px gutter from the top-left corner)
   if (wifi_connected) {
-    display.fillRect(1, 1, 2, 2, SSD1306_WHITE);
+    display.fillRect(1, 1, 2, 2, SSD1306_WHITE); // WiFi link to router
+  }
+  if (client && client.connected()) {
+    // Host link (PC): 2x2 diagonal square [[1,0],[0,1]] right after the dot
+    display.drawPixel(4, 1, SSD1306_WHITE);
+    display.drawPixel(5, 2, SSD1306_WHITE);
   }
   display.display();
 }
