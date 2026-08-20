@@ -6,9 +6,22 @@
 #include <Adafruit_GFX.h>
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <string.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Wire.h>
+
+// wake-word inference (Edge Impulse "vocedge" model)
+// Undef conflict: vocedge_inferencing.h undefs min/max/round etc.
+#ifndef EIDSP_QUANTIZE_FILTERBANK
+#define EIDSP_QUANTIZE_FILTERBANK 0 // save 10K RAM
+#endif
+#include <vocedge_inferencing.h>
+#include <algorithm>
+using std::max;
+using std::min;
+
+#include <vocedge_inferencing.h> // EI project
 
 // for message
 enum MsgType : uint8_t { MSG_AUDIO = 0x01, MSG_END = 0x02, MSG_TEXT = 0x03 };
@@ -19,6 +32,7 @@ constexpr int CHARS_PER_LINE = 10; // max chars before wrapping
 constexpr uint16_t LOADING_SPEED = 300;      // dot animation speed
 constexpr uint16_t TEXT_SCROLL_SPEED = 1200; // ms between scroll steps
 constexpr uint32_t END_HOLD_DELAY = 2000;    // hold at end of text
+constexpr uint32_t CALIBRATE_INTERVAL_MS = 120000; // recalibrate ambient noise in idle
 
 uint8_t loadingDots = 0;        // current dot count (0-3)
 uint32_t lastLoadingUpdate = 0; // last time dots were updated
@@ -40,6 +54,30 @@ WiFiClient client;
 constexpr uint16_t DISCOVERY_PORT = 8899; // UDP beacon so the PC can find us
 WiFiUDP discoveryUdp;
 uint32_t lastAnnounce = 0;
+
+// Non-blocking WiFi manager state
+bool wifi_connected = false;
+bool wifi_connecting = false;
+uint32_t wifi_connect_start = 0;
+uint32_t wifi_retry_at = 0;
+#define WIFI_CONNECT_TIMEOUT_MS 6000
+#define WIFI_RETRY_DELAY_MS 4000
+
+static uint8_t rx[2048];
+static size_t rxlen = 0;
+
+// Wake-word audio sliding window (matches the EI model: 1s @ 16kHz)
+#define EI_WINDOW_SIZE EI_CLASSIFIER_RAW_SAMPLE_COUNT
+static int16_t ei_buffer[EI_WINDOW_SIZE];      // last 1s of ambient audio
+static size_t ei_buffer_ptr = 0;               // samples since last inference
+#define EI_INFER_EVERY_SAMPLES 4000            // ~250ms of new audio per inference
+#define WAKE_CLASS "wake"                      // label trained for the wake word
+#define WAKE_THRESHOLD 0.80f                   // min confidence to wake up
+
+static int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
+  numpy::int16_to_float(&ei_buffer[offset], out_ptr, length);
+  return 0;
+}
 
 // ============================================================
 // Function declarations
@@ -93,28 +131,57 @@ const char* wifi_status_str(wl_status_t s) {
   }
 }
 
-bool connect_wifi(uint32_t timeout_ms) {
+// Kick off a connection attempt without blocking
+void start_wifi() {
   Serial.print("\n[+] Connecting to WiFi: ");
   Serial.println(WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  wifi_connecting = true;
+  wifi_connected = false;
+  wifi_connect_start = millis();
+}
 
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - t0 > timeout_ms) {
-      Serial.printf("[!] WiFi connect TIMEOUT! status=%d (%s)\n",
-                    WiFi.status(), wifi_status_str(WiFi.status()));
-      Serial.println("    Check SSID/password in src/config.h. The AP MUST be 2.4GHz.");
-      return false;
+// Poll the connection state; never blocks, never spams dots
+void update_wifi() {
+  if (wifi_connected) {
+    if (WiFi.status() == WL_CONNECTED) return;
+    wifi_connected = false;
+    wifi_connecting = false;
+    wifi_retry_at = millis() + WIFI_RETRY_DELAY_MS;
+    Serial.println("[!] WiFi connection lost. Will retry.");
+    if (client) {
+      client.stop();
+      rxlen = 0;
     }
-    delay(500);
-    Serial.print(".");
+    return;
   }
-  Serial.printf("\n[+] CONNECTED. IP: %s  Port: %d\n",
-                WiFi.localIP().toString().c_str(), TCP_PORT);
-  return true;
+
+  if (!wifi_connecting) {
+    if (millis() >= wifi_retry_at) start_wifi();
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifi_connected = true;
+    wifi_connecting = false;
+    Serial.printf("\n[+] WiFi Connected! ESP32 IP: %s  Port: %d\n",
+                  WiFi.localIP().toString().c_str(), TCP_PORT);
+    if (state == IDLE) {
+      display.clearDisplay();
+      display.setCursor(10, 25);
+      display.print("Connected!");
+      display.display();
+    }
+    tcpServer.begin();
+  } else if (millis() - wifi_connect_start > WIFI_CONNECT_TIMEOUT_MS) {
+    wifi_connecting = false;
+    wifi_retry_at = millis() + WIFI_RETRY_DELAY_MS;
+    Serial.printf("[!] WiFi connect TIMEOUT! status=%d (%s). Retrying in %d ms.\n",
+                  WiFi.status(), wifi_status_str(WiFi.status()), WIFI_RETRY_DELAY_MS);
+  }
 }
 
 // Broadcast "VOCEDGE:<ip>" over UDP so the PC can auto-discover us
@@ -144,36 +211,22 @@ void setup() {
   display.print("Connecting Wi-Fi...");
   display.display();
 
-  bool wifi_ok = connect_wifi(15000); // don't hang forever if the network is down
-
-  display.clearDisplay();
-  display.setCursor(10, 25);
-  if (wifi_ok) {
-    display.print("Connected!");
-    Serial.print("[+] WiFi Connected! ESP32 IP: ");
-    Serial.print(WiFi.localIP());
-    Serial.printf("  Port: %d\n", TCP_PORT);
-  } else {
-    display.print("WiFi FAIL!");
-    Serial.println("[!] WiFi failed. Continuing without network - eyes/mic still work.");
-  }
-  display.display();
+  start_wifi(); // non-blocking: the eyes/mic run immediately, WiFi connects in background
 
   delay(1000);
-  tcpServer.begin();
-
   pinMode(0, INPUT_PULLUP);       // Ensure BOOT button is set as input
   randomSeed(analogRead(A0));     // seed RNG from floating pin
   nextMovement = millis() + 1000; // first eye movement in 1s
 
   calibrate_mic();
 
+  run_classifier_init(); // init Edge Impulse wake-word model
+  memset(ei_buffer, 0, sizeof(ei_buffer));
+  Serial.println("Wake-word engine ready.");
+
   Serial.println("System Ready. Waiting for button press...");
   delay(500);
 }
-
-static uint8_t rx[2048];
-static size_t rxlen = 0;
 
 // ============================================================
 // Main loop
@@ -181,18 +234,19 @@ static size_t rxlen = 0;
 void loop() {
   static uint32_t last_btn_press = 0;
 
-  // Auto-reconnect if the network drops mid-session
-  if (WiFi.status() != WL_CONNECTED) {
-    static uint32_t last_reconnect = 0;
-    if (millis() - last_reconnect > 10000) {
-      last_reconnect = millis();
-      Serial.println("\n[!] WiFi lost. Attempting reconnect...");
-      connect_wifi(10000);
+  update_wifi(); // poll connectivity - never blocks
+
+  // periodically adapt the noise floor to the room while idle
+  if (state == IDLE) {
+    static uint32_t last_calibrate = 0;
+    if (millis() - last_calibrate >= CALIBRATE_INTERVAL_MS) {
+      last_calibrate = millis();
+      calibrate_mic();
     }
   }
 
   // UDP beacon every 3s so the PC can discover us without a fixed IP
-  if (WiFi.status() == WL_CONNECTED && millis() - lastAnnounce > 3000) {
+  if (wifi_connected && millis() - lastAnnounce > 3000) {
     lastAnnounce = millis();
     announce_ip();
   }
@@ -222,8 +276,8 @@ void loop() {
     Serial.println("\n[!] Python client disconnected. Waiting for reconnect...");
   }
 
-  // block-read the TCP stream
-  if (client && client.connected()) {
+  // block-read the TCP stream (only when WiFi is actually up)
+  if (wifi_connected && client && client.connected()) {
     while (client.available() > 0) {
       int to_read = client.available();
       if (rxlen + to_read > sizeof(rx)) {
@@ -288,7 +342,51 @@ void loop() {
 
   switch (state) {
   case IDLE:
-    idle();
+    idle(); // keeps the eyes wandering
+
+    // Wake-word: grab ambient audio and feed the Edge Impulse classifier
+    {
+      size_t bytes_read = record();
+      int new_samples = bytes_read / 2;
+
+      if (new_samples > 0 && (size_t)new_samples < EI_WINDOW_SIZE) {
+        // Slide the old audio out, append the new audio in
+        memmove(ei_buffer, ei_buffer + new_samples,
+                (EI_WINDOW_SIZE - new_samples) * sizeof(int16_t));
+        memcpy(ei_buffer + (EI_WINDOW_SIZE - new_samples), sample_buffer,
+               bytes_read);
+        ei_buffer_ptr += new_samples;
+
+        // Run inference whenever we've accumulated ~250ms of new audio
+        if (ei_buffer_ptr >= EI_INFER_EVERY_SAMPLES) {
+          ei_buffer_ptr = 0; // reset counter for the next chunk
+
+          signal_t signal;
+          signal.total_length = EI_WINDOW_SIZE;
+          signal.get_data = &raw_feature_get_data;
+
+          ei_impulse_result_t result = {0};
+          EI_IMPULSE_ERROR res = run_classifier(&signal, &result, false);
+
+          if (res == EI_IMPULSE_OK) {
+            for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+              if (strcmp(result.classification[i].label, WAKE_CLASS) == 0) {
+                // Print the confidence level for debugging
+                Serial.printf("Wake Word Confidence: %.2f\n",
+                              result.classification[i].value);
+
+                // If confidence is over the threshold, WAKE UP!
+                if (result.classification[i].value > WAKE_THRESHOLD) {
+                  Serial.println("\n[!] WAKE WORD DETECTED!");
+                  changeState(FOCUS_STATE);
+                  memset(ei_buffer, 0, sizeof(ei_buffer)); // prevent double-triggers
+                }
+              }
+            }
+          }
+        }
+      }
+    }
     break;
   case FOCUS_STATE:
     if (focus()) {
@@ -339,6 +437,12 @@ void loop() {
       changeState(IDLE); // return to idle when done
     break;
   }
+
+  // WiFi status dot: 2x2 px with a 1px gutter from the top-left corner
+  if (wifi_connected) {
+    display.fillRect(1, 1, 2, 2, SSD1306_WHITE);
+  }
+  display.display();
 }
   // ============================================================
   // State transition helper

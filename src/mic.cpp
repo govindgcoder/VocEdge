@@ -5,19 +5,19 @@
 
 int16_t sample_buffer[1024];
 
-static unsigned long silence_start = 0; // tail timer since last valid speech frame
 static unsigned long record_since = 0;  // when the current utterance started
 static float noise_floor = 0.0f;        // calibrated ambient level
 static float smoothed_rms = 0.0f;       // damped/EMA version of the RMS
-static bool voice_active = false;       // hysteresis: currently in a speech segment
-static int loud_blocks = 0;             // consecutive loud frames for onset gating
+static int momentum = 0;                // leaky bucket: speech energy, drains in quiet
+static bool voice_active = false;       // true while momentum > 0
+static bool heard_speech = false;       // set once the first spoken frame arrives
 
-#define VOICE_KICK_PADDING 300.0f // must exceed noise floor to (re)start a word
-#define VOICE_HOLD_PADDING 80.0f  // speech keeps the window alive above this level
-#define VOICE_START_COUNT 2       // frames above kick before voice officially "begins"
-#define SILENCE_TAIL_MS 1000      // trailing silence after speech before END
-#define MAX_RECORD_MS 10000       // safety cap so a stuck mic can't hang forever
-#define RMS_EMA_ALPHA 0.30f       // lower = more damping of single-frame spikes
+#define VOICE_LEVEL_PADDING 300.0f // RMS above noise floor counts as speech
+#define MOMENTUM_CAP 20            // max bucket fill (frames of pause grace)
+#define MOMENTUM_UP 5              // fill per loud frame
+#define MOMENTUM_DOWN 1            // leak per quiet frame
+#define MAX_RECORD_MS 10000        // safety cap so a stuck mic can't hang forever
+#define RMS_EMA_ALPHA 0.30f        // lower = more damping of single-frame spikes
 
 void setup_mic() {
   i2s_config_t i2s_config = {
@@ -82,13 +82,13 @@ void calibrate_mic() {
   if (reads > 0) {
     noise_floor = total_rms / reads;
     // "Speech padding" decides how far above the room noise speech starts
-    dynamic_threshold = noise_floor + VOICE_KICK_PADDING;
+    dynamic_threshold = noise_floor + VOICE_LEVEL_PADDING;
     smoothed_rms = 0.0f;
+    momentum = 0;
     voice_active = false;
-    loud_blocks = 0;
-    Serial.printf("[+] Calibration complete! Noise floor: %.2f  Kick: %.2f  Hold: %.2f\n\n",
-                  noise_floor, noise_floor + VOICE_KICK_PADDING,
-                  noise_floor + VOICE_HOLD_PADDING);
+    heard_speech = false;
+    Serial.printf("[+] Calibration complete! Noise floor: %.2f  Voice level: %.2f\n\n",
+                  noise_floor, noise_floor + VOICE_LEVEL_PADDING);
   }
 }
 
@@ -98,10 +98,10 @@ size_t record() {
     return bytes_read;
 }
 void reset_silence() {
-    silence_start = millis(); // reset timer the moment a new session starts
-    record_since = millis();  // mark the start of this utterance (for the cap)
+    record_since = millis(); // mark the start of this utterance (for the cap)
+    momentum = 0;
     voice_active = false;
-    loud_blocks = 0;
+    heard_speech = false;
     smoothed_rms = 0.0f;
 }
 
@@ -130,38 +130,37 @@ bool silence_check(size_t bytes_read) {
   // --- DEBUG BREADCRUMBS ---
   static unsigned long last_print = 0;
   if (millis() - last_print > 250) {
-    Serial.printf("Mic RMS: %.2f (floor %.2f kick %.2f hold %.2f)%s\n",
-                  rms, noise_floor,
-                  noise_floor + VOICE_KICK_PADDING,
-                  noise_floor + VOICE_HOLD_PADDING,
+    Serial.printf("Mic RMS: %.2f (voice level %.2f) mom %d/%d%s\n",
+                  rms, noise_floor + VOICE_LEVEL_PADDING,
+                  momentum, MOMENTUM_CAP,
                   voice_active ? " [VOICE]" : "");
     last_print = millis();
   }
   // -------------------------
 
-  float kick = noise_floor + VOICE_KICK_PADDING;
-  float hold = noise_floor + VOICE_HOLD_PADDING;
+  float level = noise_floor + VOICE_LEVEL_PADDING;
 
-  // Hysteresis via two gates:
-  //  - START needs a strong, sustained signal (filters faint background blips)
-  //  - once talking, a softer level (hold band) keeps the window alive
-  //  - speech only "ends" once a block falls below the hold floor
-  if (rms > kick) {
-    loud_blocks++;
-    if (loud_blocks >= VOICE_START_COUNT && !voice_active) {
-      voice_active = true;
-      silence_start = millis();
+  // Leaky-bucket momentum: speech spikes fill the bucket fast (+5 each
+  // loud frame, capped at 20), while micro-pauses like breaths and soft
+  // consonants only leak 1 point per frame. END fires only when the
+  // bucket fully drains to zero.
+  if (rms > level) {
+    if (!heard_speech) {
+      heard_speech = true;
       Serial.println("[+] Voice detected!");
     }
+    momentum += MOMENTUM_UP;
+    if (momentum > MOMENTUM_CAP) momentum = MOMENTUM_CAP;
+    voice_active = true;
   } else {
-    loud_blocks = 0;
-    if (rms <= hold) voice_active = false;
+    if (momentum > 0) momentum -= MOMENTUM_DOWN;
+    if (momentum == 0) voice_active = false;
   }
 
-  // Extend the recording tail while we're clearly (or softly) still talking
-  if (voice_active && rms > hold) silence_start = millis();
-
-  if (millis() - silence_start >= SILENCE_TAIL_MS) return true;
+  // END fires only once the bucket drains to zero AFTER speech was actually
+  // heard. At record start the bucket is empty, so without this the first
+  // quiet frame would instantly end the utterance.
+  if (heard_speech && momentum == 0) return true;
   if (millis() - record_since >= MAX_RECORD_MS) return true; // runaway guard
   return false;
 }
