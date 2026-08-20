@@ -4,3 +4,6 @@
 .vscode/launch.json
 .vscode/ipch
 src/config.h
+.venv/
+__pycache__/
+debug_audio.wav
