@@ -7,6 +7,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <Wire.h>
 
 // for message
@@ -35,6 +36,10 @@ uint32_t stateStartTime = 0;
 
 WiFiServer tcpServer(TCP_PORT, 1);
 WiFiClient client;
+
+constexpr uint16_t DISCOVERY_PORT = 8899; // UDP beacon so the PC can find us
+WiFiUDP discoveryUdp;
+uint32_t lastAnnounce = 0;
 
 // ============================================================
 // Function declarations
@@ -74,6 +79,55 @@ size_t frame_consume(const uint8_t *b, size_t n, uint8_t *type, uint8_t *out,
 }
 
 // ============================================================
+// WiFi helpers
+// ============================================================
+const char* wifi_status_str(wl_status_t s) {
+  switch (s) {
+    case WL_IDLE_STATUS:      return "IDLE";
+    case WL_NO_SSID_AVAIL:    return "NO_SSID_AVAIL (AP not found / wrong name, only 2.4GHz!)";
+    case WL_CONNECTED:        return "CONNECTED";
+    case WL_CONNECT_FAILED:   return "CONNECT_FAILED (wrong password?)";
+    case WL_CONNECTION_LOST:  return "CONNECTION_LOST";
+    case WL_DISCONNECTED:     return "DISCONNECTED";
+    default:                  return "UNKNOWN";
+  }
+}
+
+bool connect_wifi(uint32_t timeout_ms) {
+  Serial.print("\n[+] Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - t0 > timeout_ms) {
+      Serial.printf("[!] WiFi connect TIMEOUT! status=%d (%s)\n",
+                    WiFi.status(), wifi_status_str(WiFi.status()));
+      Serial.println("    Check SSID/password in src/config.h. The AP MUST be 2.4GHz.");
+      return false;
+    }
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.printf("\n[+] CONNECTED. IP: %s  Port: %d\n",
+                WiFi.localIP().toString().c_str(), TCP_PORT);
+  return true;
+}
+
+// Broadcast "VOCEDGE:<ip>" over UDP so the PC can auto-discover us
+void announce_ip() {
+  String ip = WiFi.localIP().toString();
+  String msg = "VOCEDGE:" + ip;
+  discoveryUdp.beginPacket(WiFi.broadcastIP(), DISCOVERY_PORT);
+  discoveryUdp.write((const uint8_t *)msg.c_str(), msg.length());
+  discoveryUdp.endPacket();
+  Serial.printf("[UDP] Announced %s\n", ip.c_str());
+}
+
+// ============================================================
 // Setup
 // ============================================================
 void setup() {
@@ -90,20 +144,20 @@ void setup() {
   display.print("Connecting Wi-Fi...");
   display.display();
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print("...");
-  }
+  bool wifi_ok = connect_wifi(15000); // don't hang forever if the network is down
 
   display.clearDisplay();
   display.setCursor(10, 25);
-  display.print("Connected!");
+  if (wifi_ok) {
+    display.print("Connected!");
+    Serial.print("[+] WiFi Connected! ESP32 IP: ");
+    Serial.print(WiFi.localIP());
+    Serial.printf("  Port: %d\n", TCP_PORT);
+  } else {
+    display.print("WiFi FAIL!");
+    Serial.println("[!] WiFi failed. Continuing without network - eyes/mic still work.");
+  }
   display.display();
-
-  Serial.print("\n[+] WiFi Connected! ESP32 IP: ");
-  Serial.print(WiFi.localIP());
-  Serial.printf("  Port: %d\n", TCP_PORT);
 
   delay(1000);
   tcpServer.begin();
@@ -126,6 +180,23 @@ static size_t rxlen = 0;
 // ============================================================
 void loop() {
   static uint32_t last_btn_press = 0;
+
+  // Auto-reconnect if the network drops mid-session
+  if (WiFi.status() != WL_CONNECTED) {
+    static uint32_t last_reconnect = 0;
+    if (millis() - last_reconnect > 10000) {
+      last_reconnect = millis();
+      Serial.println("\n[!] WiFi lost. Attempting reconnect...");
+      connect_wifi(10000);
+    }
+  }
+
+  // UDP beacon every 3s so the PC can discover us without a fixed IP
+  if (WiFi.status() == WL_CONNECTED && millis() - lastAnnounce > 3000) {
+    lastAnnounce = millis();
+    announce_ip();
+  }
+
   if (digitalRead(0) == LOW && millis() - last_btn_press > 1000) {
     last_btn_press = millis();
 

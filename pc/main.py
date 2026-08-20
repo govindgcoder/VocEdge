@@ -1,9 +1,11 @@
 import argparse
+import json
 import queue
 import socket
+import sys
 import threading
+import time
 import wave
-import json
 
 import numpy as np
 import requests
@@ -11,6 +13,32 @@ import whisper
 
 SAMPLE_RATE = 16000
 MSG_AUDIO, MSG_END, MSG_TEXT = 0x01, 0x02, 0x03
+DISCOVERY_PORT = 8899
+
+
+def discover_esp(timeout=8.0):
+    """Listen for the ESP32's 'VOCEDGE:<ip>' UDP beacon and return its IP."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    s.bind(("", DISCOVERY_PORT))
+    s.settimeout(0.5)
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            data, _ = s.recvfrom(256)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        txt = data.decode(errors="ignore").strip()
+        if txt.startswith("VOCEDGE:"):
+            ip = txt.split(":", 1)[1].strip()
+            print(f"\n[+] Discovered ESP32 at {ip}")
+            s.close()
+            return ip
+    s.close()
+    return None
 
 
 def encode_frame(msg_type, payload=b""):
@@ -114,7 +142,7 @@ def worker(jobs, sock, send_lock, args, model):
 
 def main():
     ap = argparse.ArgumentParser(description="Voice assistant host for VocEdge ESP32")
-    ap.add_argument("--ip", default="192.168.68.161")
+    ap.add_argument("--ip", default="192.168.200.137")
     ap.add_argument("--port", type=int, default=8888)
     ap.add_argument("--model", default="small.en")
     ap.add_argument("--ollama-url", default="http://localhost:11434/api/generate")
@@ -132,10 +160,23 @@ def main():
     )
     print("Models ready.")
 
+    print("\n[+] Looking for ESP32 (UDP beacon)...")
+    ip = discover_esp()
+    if ip is None:
+        ip = args.ip
+        print(f"[!] No ESP32 beacon found, falling back to --ip {ip}")
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((args.ip, args.port))
+    try:
+        sock.connect((ip, args.port))
+    except OSError as e:
+        print(f"\n[!] Could not connect to {ip}:{args.port}: {e}")
+        print("    - Is the ESP32 powered on and on the SAME WiFi (2.4GHz)?")
+        print("    - Check its serial output for the connected IP / 'WiFi FAIL'.")
+        print("    - Or pass the address explicitly: --ip <ESP32_IP>")
+        sys.exit(1)
     sock.settimeout(0.2)
-    print(f"Connected to {args.ip}:{args.port}")
+    print(f"Connected to {ip}:{args.port}")
 
     audio_buffer = bytearray()
     lock = threading.Lock()
